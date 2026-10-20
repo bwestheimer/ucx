@@ -7,11 +7,14 @@
 #include <common/test.h>
 #include <common/test_helpers.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern "C" {
 #include <ucm/api/ucm.h>
 #include <ucm/bistro/bistro.h>
+#include <ucm/util/sys.h>
 #include <ucs/arch/atomic.h>
 #include <ucs/time/time.h>
 }
@@ -161,6 +164,46 @@ protected:
         return success;
     }
 
+    static void *idle_thread_func(void *arg)
+    {
+        int fd = *(int*)arg;
+        char c;
+
+        /* Block until the write end of the pipe is closed */
+        while (read(fd, &c, 1) > 0) {
+        }
+        return NULL;
+    }
+
+    /* Keeps one extra thread alive while it exists */
+    class idle_thread {
+    public:
+        idle_thread()
+        {
+            if (pipe(m_pipefd) != 0) {
+                UCS_TEST_ABORT("pipe() failed: " << strerror(errno));
+            }
+
+            if (pthread_create(&m_thread, NULL, idle_thread_func,
+                               &m_pipefd[0]) != 0) {
+                close(m_pipefd[0]);
+                close(m_pipefd[1]);
+                UCS_TEST_ABORT("pthread_create() failed");
+            }
+        }
+
+        ~idle_thread()
+        {
+            close(m_pipefd[1]);
+            pthread_join(m_thread, NULL);
+            close(m_pipefd[0]);
+        }
+
+    private:
+        int       m_pipefd[2];
+        pthread_t m_thread;
+    };
+
     double m_grace_duration;
 };
 
@@ -259,6 +302,7 @@ UCS_TEST_SKIP_COND_F(test_bistro_batch, cancel, BISTRO_BATCH_SKIP)
 UCS_TEST_SKIP_COND_F(test_bistro_batch, one_grace_period, BISTRO_BATCH_SKIP)
 {
     const double grace = 50e-3;
+    idle_thread thread; /* A grace period is needed with other threads */
     double single_time, batch_time;
     restore_points_t rps;
 
@@ -363,4 +407,70 @@ UCS_TEST_SKIP_COND_F(test_bistro_batch, patch_while_called, BISTRO_BATCH_SKIP)
 
     EXPECT_TRUE(all_hooked);
     ASSERT_TRUE(restore(rps));
+}
+
+UCS_TEST_SKIP_COND_F(test_bistro_batch, single_thread_skip, BISTRO_BATCH_SKIP)
+{
+    const double grace = 200e-3;
+    ucs_time_t deadline;
+    int num_threads, status;
+    pid_t pid, ret;
+
+    num_threads = ucm_get_num_threads();
+    ASSERT_GT(num_threads, 0);
+    {
+        idle_thread thread;
+        EXPECT_EQ(num_threads + 1, ucm_get_num_threads());
+    }
+
+    ucm_global_opts.bistro_grace_duration = grace;
+    pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        /* The child has a single thread; report failures by exit code */
+        try {
+            restore_points_t rps;
+            double time;
+
+            if (ucm_get_num_threads() != 1) {
+                _exit(1);
+            }
+
+            time = patch_batch(rps);
+            if ((time < 0) || (time >= (grace / 2)) || !is_hooked(0) ||
+                !restore(rps)) {
+                _exit(2);
+            }
+
+            idle_thread thread;
+            if (ucm_get_num_threads() != 2) {
+                _exit(3);
+            }
+
+            time = patch_batch(rps);
+            if ((time < grace) || !is_hooked(0) || !restore(rps)) {
+                _exit(4);
+            }
+        } catch (...) {
+            _exit(5);
+        }
+
+        _exit(0);
+    }
+
+    deadline = ucs_get_time() + ucs_time_from_sec(60.0);
+    while (((ret = waitpid(pid, &status, WNOHANG)) == 0) &&
+           (ucs_get_time() < deadline)) {
+        usleep(1000);
+    }
+
+    if (ret == 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        UCS_TEST_ABORT("child process timed out");
+    }
+
+    ASSERT_EQ(pid, ret);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }

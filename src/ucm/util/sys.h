@@ -112,6 +112,12 @@ pid_t ucm_get_tid();
 
 
 /**
+ * @return Number of threads in the current process, or -1 if it is unknown.
+ */
+int ucm_get_num_threads();
+
+
+/**
  * Get memory hooks mode to use, based on the configured mode and runtime.
  *
  * @param config_mode   Configured memory hook mode.

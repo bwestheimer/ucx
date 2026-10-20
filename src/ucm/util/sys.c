@@ -30,9 +30,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <stdlib.h>
+#include <limits.h>
 
 
 #define UCM_PROC_SELF_MAPS "/proc/self/maps"
+#define UCM_PROC_SELF_STAT "/proc/self/stat"
+
+/* Number of spaces after the ')' of 'comm' up to the num_threads field */
+#define UCM_PROC_STAT_NUM_THREADS_SPACES 18
 
 ucm_global_config_t ucm_global_opts = {
     .log_level                  = UCS_LOG_LEVEL_WARN,
@@ -392,6 +398,44 @@ void *ucm_brk_syscall(void *addr)
 pid_t ucm_get_tid()
 {
     return syscall(SYS_gettid);
+}
+
+int ucm_get_num_threads()
+{
+    char buffer[1024];
+    ssize_t nread;
+    char *p, *end;
+    long value;
+    int fd, i;
+
+    /* No malloc, since this is called during hook installation */
+    fd = open(UCM_PROC_SELF_STAT, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+
+    nread = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (nread <= 0) {
+        return -1;
+    }
+
+    buffer[nread] = '\0';
+    p             = strrchr(buffer, ')');
+    for (i = 0; (p != NULL) && (i < UCM_PROC_STAT_NUM_THREADS_SPACES); ++i) {
+        p = strchr(p + 1, ' ');
+    }
+
+    if (p == NULL) {
+        return -1;
+    }
+
+    value = strtol(p + 1, &end, 10);
+    if ((end == (p + 1)) || (value <= 0) || (value > INT_MAX)) {
+        return -1;
+    }
+
+    return value;
 }
 
 void UCS_F_CTOR ucm_init()

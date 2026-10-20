@@ -115,7 +115,8 @@ static ucs_config_field_t ucm_global_config_table[] = {
   {"BISTRO_GRACE_DURATION", "50ms",
    "Grace period duration to wait for existing code flows to complete when\n"
    "applying bistro patches. This allows threads currently executing patched\n"
-   "code to finish before the patch is applied.",
+   "code to finish before the patch is applied. Hooks installed together share\n"
+   "one grace period, and it is skipped when the process has a single thread.",
    ucs_offsetof(ucm_global_config_t, bistro_grace_duration),
    UCS_CONFIG_TYPE_TIME},
 

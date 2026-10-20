@@ -67,10 +67,21 @@ void ucm_bistro_modify_code(void *dst, const ucm_bistro_lock_t *bytes)
     }
 }
 
-/* Let threads which already passed the patch lock leave the patched code */
-static void ucm_bistro_grace_wait()
+/* Time for other threads to leave code they entered before the patch lock */
+static double ucm_bistro_grace_duration()
 {
-    double deadline = ucm_get_time() + ucm_global_opts.bistro_grace_duration;
+    if ((ucm_global_opts.bistro_grace_duration > 0) &&
+        (ucm_get_num_threads() == 1)) {
+        ucm_trace("single-threaded process, skipping bistro grace period");
+        return 0;
+    }
+
+    return ucm_global_opts.bistro_grace_duration;
+}
+
+static void ucm_bistro_grace_wait(double duration)
+{
+    double deadline = ucm_get_time() + duration;
 
     while (ucm_get_time() < deadline) {
         sched_yield();
@@ -80,7 +91,8 @@ static void ucm_bistro_grace_wait()
 ucs_status_t
 ucm_bistro_apply_patch_atomic(void *dst, const void *patch, size_t len)
 {
-    size_t skip = sizeof(ucm_bistro_lock_t);
+    size_t skip           = sizeof(ucm_bistro_lock_t);
+    double grace_duration = ucm_bistro_grace_duration();
     ucs_status_t status;
 
     status = ucm_bistro_protect(dst, len, UCM_PROT_READ_WRITE_EXEC);
@@ -92,7 +104,7 @@ ucm_bistro_apply_patch_atomic(void *dst, const void *patch, size_t len)
     ucm_bistro_patch_lock(dst);
     ucs_clear_cache(dst, UCS_PTR_BYTE_OFFSET(dst, len));
 
-    ucm_bistro_grace_wait();
+    ucm_bistro_grace_wait(grace_duration);
 
     /* Copy the payload behind the lock */
     memcpy(UCS_PTR_BYTE_OFFSET(dst, skip), UCS_PTR_BYTE_OFFSET(patch, skip),
@@ -236,10 +248,13 @@ ucs_status_t ucm_bistro_batch_commit(ucm_bistro_batch_t *batch)
     ucm_bistro_batch_entry_t *end = batch->entries + batch->count;
     ucm_bistro_batch_entry_t *entry, *prev;
     ucs_status_t status, prot_status;
+    double grace_duration;
 
     if (batch->count == 0) {
         return UCS_OK;
     }
+
+    grace_duration = ucm_bistro_grace_duration();
 
     /* Make all sites writable before modifying any code */
     for (entry = batch->entries; entry < end; ++entry) {
@@ -274,7 +289,7 @@ ucs_status_t ucm_bistro_batch_commit(ucm_bistro_batch_t *batch)
                         UCS_PTR_BYTE_OFFSET(entry->func_ptr, entry->patch_len));
     }
 
-    ucm_bistro_grace_wait();
+    ucm_bistro_grace_wait(grace_duration);
 
     /* Copy each payload behind its lock, then unlock */
     for (entry = batch->entries; entry < end; ++entry) {
