@@ -103,6 +103,7 @@ gtest_SOURCES = \
 	common/test_perf.cc \
 	common/test.cc \
 	\
+	ucm/bistro_batch.cc \
 	ucm/malloc_hook.cc \
 	\
 	uct/test_amo.cc \

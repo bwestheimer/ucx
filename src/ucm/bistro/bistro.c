@@ -67,11 +67,20 @@ void ucm_bistro_modify_code(void *dst, const ucm_bistro_lock_t *bytes)
     }
 }
 
+/* Let threads which already passed the patch lock leave the patched code */
+static void ucm_bistro_grace_wait()
+{
+    double deadline = ucm_get_time() + ucm_global_opts.bistro_grace_duration;
+
+    while (ucm_get_time() < deadline) {
+        sched_yield();
+    }
+}
+
 ucs_status_t
 ucm_bistro_apply_patch_atomic(void *dst, const void *patch, size_t len)
 {
     size_t skip = sizeof(ucm_bistro_lock_t);
-    double deadline;
     ucs_status_t status;
 
     status = ucm_bistro_protect(dst, len, UCM_PROT_READ_WRITE_EXEC);
@@ -83,10 +92,7 @@ ucm_bistro_apply_patch_atomic(void *dst, const void *patch, size_t len)
     ucm_bistro_patch_lock(dst);
     ucs_clear_cache(dst, UCS_PTR_BYTE_OFFSET(dst, len));
 
-    deadline = ucm_get_time() + ucm_global_opts.bistro_grace_duration;
-    while (ucm_get_time() < deadline) {
-        sched_yield();
-    }
+    ucm_bistro_grace_wait();
 
     /* Copy the payload behind the lock */
     memcpy(UCS_PTR_BYTE_OFFSET(dst, skip), UCS_PTR_BYTE_OFFSET(patch, skip),
@@ -120,6 +126,29 @@ ucs_status_t ucm_bistro_apply_patch(void *dst, void *patch, size_t len)
     return status;
 }
 
+void ucm_bistro_batch_init(ucm_bistro_batch_t *batch,
+                           ucm_bistro_batch_entry_t *entries,
+                           unsigned max_count)
+{
+    batch->entries   = entries;
+    batch->count     = 0;
+    batch->max_count = max_count;
+}
+
+void ucm_bistro_batch_cancel(ucm_bistro_batch_t *batch)
+{
+    ucm_bistro_batch_entry_t *entry;
+
+    for (entry = batch->entries; entry < batch->entries + batch->count;
+         ++entry) {
+        if (entry->restore_point != NULL) {
+            ucm_bistro_remove_restore_point(entry->restore_point);
+        }
+    }
+
+    batch->count = 0;
+}
+
 #if defined(__x86_64__) || defined (__aarch64__) || defined (__riscv)
 ucs_status_t ucm_bistro_patch(void *func_ptr, void *hook, const char *symbol,
                               void **orig_func_p,
@@ -136,6 +165,148 @@ ucs_status_t ucm_bistro_patch(void *func_ptr, void *hook, const char *symbol,
     }
 
     return ucm_bistro_apply_patch_atomic(func_ptr, patch, patch_len);
+}
+
+static int ucm_bistro_batch_overlaps(const ucm_bistro_batch_t *batch,
+                                     const ucm_bistro_batch_entry_t *new_entry)
+{
+    const ucm_bistro_batch_entry_t *entry;
+
+    for (entry = batch->entries; entry < new_entry; ++entry) {
+        if ((UCS_PTR_BYTE_DIFF(entry->func_ptr, new_entry->func_ptr) <
+             (ptrdiff_t)entry->patch_len) &&
+            (UCS_PTR_BYTE_DIFF(new_entry->func_ptr, entry->func_ptr) <
+             (ptrdiff_t)new_entry->patch_len)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+ucs_status_t ucm_bistro_batch_add(ucm_bistro_batch_t *batch, void *func_ptr,
+                                  void *hook, const char *symbol,
+                                  void **orig_func_p,
+                                  ucm_bistro_restore_point_t **rp)
+{
+    ucm_bistro_batch_entry_t *entry;
+    ucs_status_t status;
+
+    if (batch->count >= batch->max_count) {
+        return UCS_ERR_EXCEEDS_LIMIT;
+    }
+
+    entry                = &batch->entries[batch->count];
+    entry->func_ptr      = func_ptr;
+    entry->symbol        = symbol;
+    entry->orig_func     = NULL;
+    entry->orig_func_p   = orig_func_p;
+    entry->restore_point = NULL;
+    entry->rp            = rp;
+
+    status = ucm_bistro_patch_prepare(func_ptr, hook, symbol,
+                                      (orig_func_p != NULL) ?
+                                              &entry->orig_func : NULL,
+                                      (rp != NULL) ? &entry->restore_point :
+                                                     NULL,
+                                      entry->patch, &entry->patch_len);
+    if (status != UCS_OK) {
+        goto err;
+    }
+
+    if (ucm_bistro_batch_overlaps(batch, entry)) {
+        ucm_diag("'%s' at %p overlaps a pending patch", symbol, func_ptr);
+        status = UCS_ERR_ALREADY_EXISTS;
+        goto err;
+    }
+
+    ++batch->count;
+    return UCS_OK;
+
+err:
+    if (entry->restore_point != NULL) {
+        ucm_bistro_remove_restore_point(entry->restore_point);
+    }
+    return status;
+}
+
+ucs_status_t ucm_bistro_batch_commit(ucm_bistro_batch_t *batch)
+{
+    size_t skip                   = sizeof(ucm_bistro_lock_t);
+    ucm_bistro_batch_entry_t *end = batch->entries + batch->count;
+    ucm_bistro_batch_entry_t *entry, *prev;
+    ucs_status_t status, prot_status;
+
+    if (batch->count == 0) {
+        return UCS_OK;
+    }
+
+    /* Make all sites writable before modifying any code */
+    for (entry = batch->entries; entry < end; ++entry) {
+        status = ucm_bistro_protect(entry->func_ptr, entry->patch_len,
+                                    UCM_PROT_READ_WRITE_EXEC);
+        if (UCS_STATUS_IS_ERR(status)) {
+            ucm_diag("failed to make '%s' at %p writable", entry->symbol,
+                     entry->func_ptr);
+            for (prev = batch->entries; prev < entry; ++prev) {
+                ucm_bistro_protect(prev->func_ptr, prev->patch_len,
+                                   UCM_PROT_READ_EXEC);
+            }
+            ucm_bistro_batch_cancel(batch);
+            return status;
+        }
+    }
+
+    /* Hooks may run as soon as a site is unlocked */
+    for (entry = batch->entries; entry < end; ++entry) {
+        if (entry->orig_func_p != NULL) {
+            *entry->orig_func_p = entry->orig_func;
+        }
+        if (entry->rp != NULL) {
+            *entry->rp = entry->restore_point;
+        }
+    }
+
+    /* Lock all sites, then wait once for existing flows to complete */
+    for (entry = batch->entries; entry < end; ++entry) {
+        ucm_bistro_patch_lock(entry->func_ptr);
+        ucs_clear_cache(entry->func_ptr,
+                        UCS_PTR_BYTE_OFFSET(entry->func_ptr, entry->patch_len));
+    }
+
+    ucm_bistro_grace_wait();
+
+    /* Copy each payload behind its lock, then unlock */
+    for (entry = batch->entries; entry < end; ++entry) {
+        memcpy(UCS_PTR_BYTE_OFFSET(entry->func_ptr, skip),
+               UCS_PTR_BYTE_OFFSET(entry->patch, skip),
+               entry->patch_len - skip);
+        ucs_clear_cache(entry->func_ptr,
+                        UCS_PTR_BYTE_OFFSET(entry->func_ptr, entry->patch_len));
+        ucm_bistro_modify_code(entry->func_ptr,
+                               (const ucm_bistro_lock_t*)entry->patch);
+    }
+
+    /* Sites may share a page, so restore protection only after all copies */
+    status = UCS_OK;
+    for (entry = batch->entries; entry < end; ++entry) {
+        prot_status = ucm_bistro_protect(entry->func_ptr, entry->patch_len,
+                                         UCM_PROT_READ_EXEC);
+        ucs_clear_cache(entry->func_ptr,
+                        UCS_PTR_BYTE_OFFSET(entry->func_ptr, entry->patch_len));
+        if (UCS_STATUS_IS_ERR(prot_status) && !UCS_STATUS_IS_ERR(status)) {
+            status = prot_status;
+        }
+        ucm_debug("patched '%s' at %p", entry->symbol, entry->func_ptr);
+    }
+
+    batch->count = 0;
+    return status;
+}
+
+int ucm_bistro_batch_is_deferred()
+{
+    return 1;
 }
 
 struct ucm_bistro_restore_point {
@@ -283,6 +454,27 @@ err:
              (dladdr_ret != 0) ? dli.dli_fname : "(unknown)", min_src_length,
              ucm_bistro_dump_code(src, 16, code_buf, sizeof(code_buf)));
     return status;
+}
+
+#else
+
+int ucm_bistro_batch_is_deferred()
+{
+    return 0;
+}
+
+ucs_status_t ucm_bistro_batch_add(ucm_bistro_batch_t *batch, void *func_ptr,
+                                  void *hook, const char *symbol,
+                                  void **orig_func_p,
+                                  ucm_bistro_restore_point_t **rp)
+{
+    /* No patch lock and no grace period, so patch immediately */
+    return ucm_bistro_patch(func_ptr, hook, symbol, orig_func_p, rp);
+}
+
+ucs_status_t ucm_bistro_batch_commit(ucm_bistro_batch_t *batch)
+{
+    return UCS_OK;
 }
 
 #endif
