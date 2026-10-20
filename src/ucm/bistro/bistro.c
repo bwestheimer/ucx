@@ -121,6 +121,23 @@ ucs_status_t ucm_bistro_apply_patch(void *dst, void *patch, size_t len)
 }
 
 #if defined(__x86_64__) || defined (__aarch64__) || defined (__riscv)
+ucs_status_t ucm_bistro_patch(void *func_ptr, void *hook, const char *symbol,
+                              void **orig_func_p,
+                              ucm_bistro_restore_point_t **rp)
+{
+    uint8_t patch[UCM_BISTRO_PATCH_MAX_LEN];
+    ucs_status_t status;
+    size_t patch_len;
+
+    status = ucm_bistro_patch_prepare(func_ptr, hook, symbol, orig_func_p, rp,
+                                      patch, &patch_len);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    return ucm_bistro_apply_patch_atomic(func_ptr, patch, patch_len);
+}
+
 struct ucm_bistro_restore_point {
     void               *addr;     /* address of function to restore */
     size_t             patch_len; /* patch length */

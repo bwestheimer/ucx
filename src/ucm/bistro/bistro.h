@@ -28,6 +28,10 @@ typedef struct ucm_bistro_restore_point ucm_bistro_restore_point_t;
 #endif
 
 
+/* Maximal length of the code written by @ref ucm_bistro_patch */
+#define UCM_BISTRO_PATCH_MAX_LEN 32
+
+
 /* Context for copying code to another location while preserving its previous
    functionality */
 typedef struct {
