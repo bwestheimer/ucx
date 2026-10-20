@@ -353,6 +353,10 @@ static ucs_status_t
 ucm_cuda_install_hooks(ucm_cuda_func_t *funcs, const char *name,
                        ucm_mmap_hook_mode_t mode, int *installed_hooks_p)
 {
+    /* Sized for the largest table; a larger one fails with EXCEEDS_LIMIT */
+    ucm_bistro_batch_entry_t entries[ucs_static_array_size(
+            ucm_cuda_driver_funcs)];
+    ucm_bistro_batch_t batch;
     ucm_cuda_func_t *func;
     ucs_status_t status;
     void *func_ptr;
@@ -369,6 +373,8 @@ ucm_cuda_install_hooks(ucm_cuda_func_t *funcs, const char *name,
         return UCS_OK;
     }
 
+    /* Bistro hooks are applied together by the commit below */
+    ucm_bistro_batch_init(&batch, entries, ucs_static_array_size(entries));
     count = 0;
     for (func = funcs; func->patch.symbol != NULL; ++func) {
         func_ptr = ucm_reloc_get_orig(func->patch.symbol, func->patch.value);
@@ -377,24 +383,37 @@ ucm_cuda_install_hooks(ucm_cuda_func_t *funcs, const char *name,
         }
 
         if (mode == UCM_MMAP_HOOK_BISTRO) {
-            status = ucm_bistro_patch(func_ptr, func->patch.value,
-                                      func->patch.symbol, func->orig_func_ptr,
-                                      NULL);
+            status = ucm_bistro_batch_add(&batch, func_ptr, func->patch.value,
+                                          func->patch.symbol,
+                                          func->orig_func_ptr, NULL);
         } else if (mode == UCM_MMAP_HOOK_RELOC) {
             status = ucm_reloc_modify(&func->patch);
         } else {
             break;
         }
 
-        if (status != UCS_OK) {
+        if (status == UCS_ERR_ALREADY_EXISTS) {
+            /* Aliased symbol, already patched through another name */
+            ucm_debug("skipping %s hook for '%s' at %p",
+                      ucm_mmap_hook_modes[mode], func->patch.symbol, func_ptr);
+            continue;
+        } else if (status != UCS_OK) {
             ucm_diag("failed to install %s hook for '%s'",
                      ucm_mmap_hook_modes[mode], func->patch.symbol);
+            ucm_bistro_batch_cancel(&batch);
             return status;
         }
 
         ucm_debug("installed %s hook for '%s'", ucm_mmap_hook_modes[mode],
                   func->patch.symbol);
         ++count;
+    }
+
+    status = ucm_bistro_batch_commit(&batch);
+    if (status != UCS_OK) {
+        ucm_diag("failed to install %s hooks on %s API",
+                 ucm_mmap_hook_modes[mode], name);
+        return status;
     }
 
     *installed_hooks_p |= UCS_BIT(mode);

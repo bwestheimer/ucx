@@ -6,11 +6,14 @@
 
 #include <common/test.h>
 #include <common/test_helpers.h>
+#include <pthread.h>
+#include <unistd.h>
 
 extern "C" {
 #include <ucm/api/ucm.h>
 #include <ucm/bistro/bistro.h>
 #include <ucs/arch/atomic.h>
+#include <ucs/time/time.h>
 }
 
 
@@ -101,6 +104,47 @@ protected:
     static void *func_ptr(unsigned index)
     {
         return (void*)bistro_batch_funcs[index];
+    }
+
+    /* Returns the commit time in seconds, or -1 on failure */
+    static double patch_batch(restore_points_t &rps)
+    {
+        ucm_bistro_batch_entry_t entries[BISTRO_BATCH_NUM_FUNCS];
+        ucm_bistro_batch_t batch;
+        ucs_status_t status;
+        double start;
+
+        rps.assign(BISTRO_BATCH_NUM_FUNCS, NULL);
+        ucm_bistro_batch_init(&batch, entries, BISTRO_BATCH_NUM_FUNCS);
+        for (unsigned i = 0; i < BISTRO_BATCH_NUM_FUNCS; ++i) {
+            status = ucm_bistro_batch_add(&batch, func_ptr(i),
+                                          (void*)bistro_batch_hooks[i],
+                                          "bistro_batch_func", NULL, &rps[i]);
+            if (status != UCS_OK) {
+                ucm_bistro_batch_cancel(&batch);
+                return -1;
+            }
+        }
+
+        start  = ucs_get_accurate_time();
+        status = ucm_bistro_batch_commit(&batch);
+        return (status == UCS_OK) ? (ucs_get_accurate_time() - start) : -1;
+    }
+
+    static double patch_single(restore_points_t &rps)
+    {
+        double start = ucs_get_accurate_time();
+
+        rps.assign(BISTRO_BATCH_NUM_FUNCS, NULL);
+        for (unsigned i = 0; i < BISTRO_BATCH_NUM_FUNCS; ++i) {
+            if (ucm_bistro_patch(func_ptr(i), (void*)bistro_batch_hooks[i],
+                                 "bistro_batch_func", NULL,
+                                 &rps[i]) != UCS_OK) {
+                return -1;
+            }
+        }
+
+        return ucs_get_accurate_time() - start;
     }
 
     static bool restore(restore_points_t &rps)
@@ -210,4 +254,113 @@ UCS_TEST_SKIP_COND_F(test_bistro_batch, cancel, BISTRO_BATCH_SKIP)
     /* An empty batch commits without waiting */
     ucm_global_opts.bistro_grace_duration = 10.0;
     EXPECT_UCS_OK(ucm_bistro_batch_commit(&batch));
+}
+
+UCS_TEST_SKIP_COND_F(test_bistro_batch, one_grace_period, BISTRO_BATCH_SKIP)
+{
+    const double grace = 50e-3;
+    double single_time, batch_time;
+    restore_points_t rps;
+
+    ucm_global_opts.bistro_grace_duration = grace;
+
+    single_time = patch_single(rps);
+    ASSERT_GE(single_time, 0);
+    ASSERT_TRUE(restore(rps));
+
+    batch_time = patch_batch(rps);
+    ASSERT_GE(batch_time, 0);
+    for (unsigned i = 0; i < BISTRO_BATCH_NUM_FUNCS; ++i) {
+        EXPECT_TRUE(is_hooked(i)) << i;
+    }
+    ASSERT_TRUE(restore(rps));
+
+    UCS_TEST_MESSAGE << "patching " << BISTRO_BATCH_NUM_FUNCS
+                     << " functions: single " << (single_time * 1e3)
+                     << " ms, batch " << (batch_time * 1e3) << " ms";
+    EXPECT_GE(single_time, BISTRO_BATCH_NUM_FUNCS * grace);
+    EXPECT_GE(batch_time, grace);
+    EXPECT_LT(batch_time, single_time / 2);
+}
+
+class bistro_batch_caller {
+public:
+    bistro_batch_caller() : m_stop(false), m_hooked_mask(0)
+    {
+        m_started = (pthread_create(&m_thread, NULL, thread_func, this) == 0);
+    }
+
+    ~bistro_batch_caller()
+    {
+        stop();
+    }
+
+    bool started() const
+    {
+        return m_started;
+    }
+
+    void stop()
+    {
+        if (m_started && !m_stop) {
+            m_stop = true;
+            pthread_join(m_thread, NULL);
+        }
+    }
+
+    bool all_hooked() const
+    {
+        return m_hooked_mask == UCS_MASK(BISTRO_BATCH_NUM_FUNCS);
+    }
+
+private:
+    static void *thread_func(void *arg)
+    {
+        bistro_batch_caller *self = (bistro_batch_caller*)arg;
+
+        while (!self->m_stop) {
+            for (unsigned i = 0; i < BISTRO_BATCH_NUM_FUNCS; ++i) {
+                if (bistro_batch_funcs[i](1) < 0) {
+                    self->m_hooked_mask |= UCS_BIT(i);
+                }
+            }
+        }
+        return NULL;
+    }
+
+    pthread_t         m_thread;
+    bool              m_started;
+    volatile bool     m_stop;
+    volatile unsigned m_hooked_mask;
+};
+
+UCS_TEST_SKIP_COND_F(test_bistro_batch, patch_while_called, BISTRO_BATCH_SKIP)
+{
+    const int num_threads = 4;
+    bistro_batch_caller callers[num_threads];
+    restore_points_t rps;
+    ucs_time_t deadline;
+    bool all_hooked;
+
+    for (int i = 0; i < num_threads; ++i) {
+        ASSERT_TRUE(callers[i].started());
+    }
+
+    /* Default grace period, while threads call the patched functions */
+    ASSERT_GE(patch_batch(rps), 0);
+
+    deadline = ucs_get_time() + ucs_time_from_sec(10.0);
+    do {
+        all_hooked = true;
+        for (int i = 0; i < num_threads; ++i) {
+            all_hooked = all_hooked && callers[i].all_hooked();
+        }
+    } while (!all_hooked && (ucs_get_time() < deadline));
+
+    for (int i = 0; i < num_threads; ++i) {
+        callers[i].stop();
+    }
+
+    EXPECT_TRUE(all_hooked);
+    ASSERT_TRUE(restore(rps));
 }

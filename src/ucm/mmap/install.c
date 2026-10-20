@@ -362,6 +362,10 @@ ucs_status_t ucm_mmap_test_installed_events(int events)
 static ucs_status_t ucs_mmap_install_reloc(int events)
 {
     static int installed_events = 0;
+    ucm_bistro_batch_entry_t batch_entries[ucs_static_array_size(
+            ucm_mmap_funcs)];
+    int batch_events            = 0;
+    ucm_bistro_batch_t batch;
     ucm_mmap_func_t *entry;
     ucs_status_t status;
     void *func_ptr;
@@ -371,6 +375,9 @@ static ucs_status_t ucs_mmap_install_reloc(int events)
         return UCS_ERR_UNSUPPORTED;
     }
 
+    /* Bistro hooks are applied together by the commit below */
+    ucm_bistro_batch_init(&batch, batch_entries,
+                          ucs_static_array_size(batch_entries));
     for (entry = ucm_mmap_funcs; entry->patch.symbol != NULL; ++entry) {
         if (!((entry->event_type|entry->deps) & events)) {
             /* Not required */
@@ -388,6 +395,9 @@ static ucs_status_t ucs_mmap_install_reloc(int events)
 
         if (ucm_mmap_hook_mode() == UCM_MMAP_HOOK_RELOC) {
             status = ucm_reloc_modify(&entry->patch);
+            if (status == UCS_OK) {
+                installed_events |= entry->event_type;
+            }
         } else {
             ucm_assert(ucm_mmap_hook_mode() == UCM_MMAP_HOOK_BISTRO);
             func_ptr = ucm_reloc_get_orig(entry->patch.symbol,
@@ -402,19 +412,32 @@ static ucs_status_t ucs_mmap_install_reloc(int events)
             if (func_ptr == NULL) {
                 status = UCS_ERR_NO_ELEM;
             } else {
-                status = ucm_bistro_patch(func_ptr, entry->patch.value,
-                                          entry->patch.symbol, NULL, NULL);
+                status = ucm_bistro_batch_add(&batch, func_ptr,
+                                              entry->patch.value,
+                                              entry->patch.symbol, NULL, NULL);
+                if (ucm_bistro_batch_is_deferred()) {
+                    batch_events |= entry->event_type;
+                } else if (status == UCS_OK) {
+                    /* Without a patch lock the hook is installed by add */
+                    installed_events |= entry->event_type;
+                }
             }
         }
         if (status != UCS_OK) {
             ucm_warn("failed to install %s hook for '%s'", UCM_HOOK_STR,
                      entry->patch.symbol);
+            ucm_bistro_batch_cancel(&batch);
             return status;
         }
-
-        installed_events |= entry->event_type;
     }
 
+    status = ucm_bistro_batch_commit(&batch);
+    if (status != UCS_OK) {
+        ucm_warn("failed to install %s hooks", UCM_HOOK_STR);
+        return status;
+    }
+
+    installed_events |= batch_events;
     return UCS_OK;
 }
 
